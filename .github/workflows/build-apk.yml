@@ -3,9 +3,7 @@ name: Build HopTrace APK
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
 
 permissions:
   contents: read
@@ -50,8 +48,6 @@ jobs:
             exit 1
           fi
 
-          # API 37 is packaged by sdkmanager as android-37.0, while AGP 9.5
-          # resolves compileSdk 37 using the android-37 directory name.
           if [[ -d "$SDK_ROOT/platforms/android-37.0" && ! -e "$SDK_ROOT/platforms/android-37" ]]; then
             ln -s android-37.0 "$SDK_ROOT/platforms/android-37"
           fi
@@ -59,10 +55,11 @@ jobs:
           test -s "$SDK_ROOT/platforms/android-37/android.jar"
           test -x "$SDK_ROOT/build-tools/37.0.0/aapt"
           test -x "$SDK_ROOT/build-tools/37.0.0/apksigner"
+          test -x "$SDK_ROOT/build-tools/37.0.0/zipalign"
           test -x "$SDK_ROOT/ndk/28.2.13676358/ndk-build"
           test -x "$SDK_ROOT/cmake/3.22.1/bin/cmake"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "Android SDK, Build Tools, NDK and CMake are installed and verified."
+          echo "Android SDK 37, Build Tools, NDK and CMake verified."
 
       - name: Install Gradle 9.6.0
         shell: bash
@@ -70,14 +67,14 @@ jobs:
           set -euo pipefail
           VERSION="9.6.0"
           ZIP="$RUNNER_TEMP/gradle-${VERSION}-bin.zip"
-          curl --fail --location --retry 4 --retry-delay 3 \
+          curl --fail --location --retry 4 --retry-delay 3 --retry-all-errors \
             "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
             --output "$ZIP"
           unzip -q "$ZIP" -d "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/gradle-${VERSION}/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/gradle-${VERSION}/bin/gradle" --version
 
-      - name: Locate project and preflight source
+      - name: Locate project, fix known Java issue and configure Maven mirror
         id: project
         shell: bash
         run: |
@@ -96,19 +93,20 @@ jobs:
           if [[ ${#ROOTS[@]} -ne 1 ]]; then
             echo "::error::Expected exactly one Android Gradle project; found ${#ROOTS[@]}."
             printf 'Candidate: %s\n' "${ROOTS[@]}"
-            find . -maxdepth 5 -type f \
-              -not -path './.git/*' -not -path '*/.gradle/*' | sort | head -250
+            find . -maxdepth 6 -type f -not -path './.git/*' | sort | head -250
             exit 1
           fi
 
           PROJECT_DIR="${ROOTS[0]#./}"
           [[ -n "$PROJECT_DIR" ]] || PROJECT_DIR='.'
           APP="$PROJECT_DIR/app"
+          SETTINGS="$PROJECT_DIR/settings.gradle"
           MAIN="$APP/src/main/java/com/hoptrace/app/MainActivity.java"
 
           required=(
-            "$PROJECT_DIR/settings.gradle"
+            "$SETTINGS"
             "$PROJECT_DIR/build.gradle"
+            "$PROJECT_DIR/gradle.properties"
             "$APP/build.gradle"
             "$APP/src/main/AndroidManifest.xml"
             "$APP/src/main/cpp/CMakeLists.txt"
@@ -127,12 +125,12 @@ jobs:
             echo "::error::Unexpected applicationId; expected com.hoptrace.app."
             exit 1
           }
-          grep -Fq "compileSdk 37" "$APP/build.gradle" || {
-            echo "::error::compileSdk must be 37 for this build configuration."
+          grep -Fq 'compileSdk 37' "$APP/build.gradle" || {
+            echo "::error::compileSdk must be 37."
             exit 1
           }
-          grep -Fq "targetSdk 37" "$APP/build.gradle" || {
-            echo "::error::targetSdk must be 37 for this build configuration."
+          grep -Fq 'targetSdk 37' "$APP/build.gradle" || {
+            echo "::error::targetSdk must be 37."
             exit 1
           }
           grep -Fq 'System.loadLibrary("hoptrace")' "$APP/src/main/java/com/hoptrace/app/NativeTraceroute.java" || {
@@ -144,10 +142,7 @@ jobs:
             exit 1
           }
 
-          # The source archive originally shipped protected here. Activity
-          # implements ComponentCallbacks, whose onLowMemory() is public.
-          # Fix this exact known compiler blocker in the runner checkout too,
-          # so an older uploaded source folder still produces the corrected APK.
+          # Fix the exact Java visibility error seen in the previous Actions log.
           python3 - "$MAIN" <<'PY'
           from pathlib import Path
           import sys
@@ -160,34 +155,85 @@ jobs:
                   raise SystemExit(f'Expected one old onLowMemory declaration, found {s.count(old)}')
               s = s.replace(old, new)
               p.write_text(s, encoding='utf-8')
-              print('Applied onLowMemory() public visibility fix.')
+              print('Applied onLowMemory() visibility correction.')
           elif s.count(new) == 1:
               print('onLowMemory() visibility is already correct.')
           else:
               raise SystemExit('Could not verify the required public onLowMemory() override.')
           PY
 
+          # Maven Central mirror first: Gradle will fetch a module's artifacts
+          # from the same repository that supplied its metadata. The prior run
+          # found KGP 2.2.10 metadata on Maven Central but failed to fetch its JARs.
+          python3 - "$SETTINGS" <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          s = p.read_text(encoding='utf-8')
+          mirror = 'maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2/") }'
+          # Normalize rather than append: put the mirror first in each of the
+          # two repositories blocks, so Gradle cannot lock KGP metadata to the
+          # canonical Maven Central endpoint before trying the mirror.
+          lines = [line for line in s.splitlines()
+                   if 'maven-central.storage-download.googleapis.com/maven2/' not in line]
+          out = []
+          blocks = 0
+          for line in lines:
+              out.append(line)
+              if line.strip() == 'repositories {':
+                  indent = line[:len(line) - len(line.lstrip())] + '    '
+                  out.append(indent + mirror)
+                  blocks += 1
+          updated = '\n'.join(out) + '\n'
+          if blocks != 2 or updated.count('maven-central.storage-download.googleapis.com/maven2/') != 2:
+              raise SystemExit(f'Expected exactly two Gradle repositories blocks; found {blocks}.')
+          p.write_text(updated, encoding='utf-8')
+          print('Configured Google-hosted Maven Central mirror before Maven Central in both repository blocks.')
+          PY
+
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "APK_PATH=$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_ENV"
           echo "Detected and validated project root: $PROJECT_DIR"
-          echo "Source preflight passed."
+          echo "Source and repository preflight passed."
+
+      - name: Verify Kotlin Gradle plugin artifacts are reachable from mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://maven-central.storage-download.googleapis.com/maven2"
+          artifacts=(
+            "org/jetbrains/kotlin/kotlin-gradle-plugin-api/2.2.10/kotlin-gradle-plugin-api-2.2.10.jar"
+            "org/jetbrains/kotlin/kotlin-gradle-plugin-idea/2.2.10/kotlin-gradle-plugin-idea-2.2.10.jar"
+          )
+          for path in "${artifacts[@]}"; do
+            out="$RUNNER_TEMP/$(basename "$path")"
+            echo "Checking $path"
+            curl --fail --show-error --silent --location \
+              --retry 5 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 \
+              "$BASE/$path" --output "$out"
+            test -s "$out"
+            echo "Verified $(basename "$path") ($(stat -c%s "$out") bytes)."
+          done
 
       - name: Build debug APK
         shell: bash
         run: |
           set -euo pipefail
           echo "Building HopTrace from: $PROJECT_DIR"
-          gradle --no-daemon --stacktrace --console=plain \
+          gradle --no-daemon --refresh-dependencies --stacktrace --console=plain \
             --project-dir "$PROJECT_DIR" assembleDebug
 
-      - name: Verify APK package, signature and native libraries
+      - name: Verify APK package, alignment, signature and native libraries
         shell: bash
         run: |
           set -euo pipefail
           APK="$APK_PATH"
           SDK="$ANDROID_SDK_ROOT"
-          AAPT="$SDK/build-tools/37.0.0/aapt"
-          APKSIGNER="$SDK/build-tools/37.0.0/apksigner"
+          TOOLS="$SDK/build-tools/37.0.0"
+          AAPT="$TOOLS/aapt"
+          APKSIGNER="$TOOLS/apksigner"
+          ZIPALIGN="$TOOLS/zipalign"
 
           if [[ ! -s "$APK" ]]; then
             echo "::error::Gradle completed but the expected APK is missing: $APK"
@@ -195,6 +241,7 @@ jobs:
             exit 1
           fi
 
+          "$ZIPALIGN" -c -v 4 "$APK"
           "$APKSIGNER" verify --verbose "$APK"
           "$AAPT" dump badging "$APK" > "$RUNNER_TEMP/hoptrace-badging.txt"
           grep -Fq "package: name='com.hoptrace.app'" "$RUNNER_TEMP/hoptrace-badging.txt"
@@ -202,10 +249,12 @@ jobs:
           grep -Fq "targetSdkVersion:'37'" "$RUNNER_TEMP/hoptrace-badging.txt"
 
           unzip -Z1 "$APK" > "$RUNNER_TEMP/hoptrace-apk-files.txt"
-          grep -Fxq 'lib/arm64-v8a/libhoptrace.so' "$RUNNER_TEMP/hoptrace-apk-files.txt" || {
-            echo "::error::ARM64 native traceroute library is missing from the APK."
-            exit 1
-          }
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            grep -Fxq "lib/$abi/libhoptrace.so" "$RUNNER_TEMP/hoptrace-apk-files.txt" || {
+              echo "::error::Native traceroute library missing for ABI: $abi"
+              exit 1
+            }
+          done
 
           (
             cd "$(dirname "$APK")"
@@ -214,7 +263,7 @@ jobs:
           echo "Verified APK metadata:"
           grep -E "^(package:|sdkVersion:|targetSdkVersion:)" "$RUNNER_TEMP/hoptrace-badging.txt" || true
           ls -lh "$APK" "$APK.sha256"
-          echo "APK verification passed."
+          echo "APK alignment, signature, package metadata and native ABI checks passed."
 
       - name: Upload installable APK and checksum
         uses: actions/upload-artifact@v7
@@ -233,6 +282,10 @@ jobs:
         with:
           name: HopTrace-build-diagnostics
           path: |
+            ${{ env.PROJECT_DIR }}/settings.gradle
+            ${{ env.PROJECT_DIR }}/build.gradle
+            ${{ env.PROJECT_DIR }}/gradle.properties
+            ${{ env.PROJECT_DIR }}/app/build.gradle
             ${{ env.PROJECT_DIR }}/app/build/reports
             ${{ env.PROJECT_DIR }}/app/.cxx
           if-no-files-found: ignore
