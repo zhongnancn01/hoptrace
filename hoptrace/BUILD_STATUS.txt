@@ -1,0 +1,34 @@
+HopTrace 1.0.0 — source audit and build status
+================================================
+
+This source archive does not contain a prebuilt APK.
+
+Fix included in this revision:
+- MainActivity.onLowMemory() is public, as required by ComponentCallbacks.
+- The GitHub Actions workflow detects the Gradle project root even when it is
+  nested or its directory name contains spaces.
+- The workflow checks the project structure and JNI/CMake library naming before
+  starting Gradle.
+- The workflow installs pinned Android 17 SDK platform, Build Tools, NDK and CMake.
+- The workflow verifies APK signature, package ID, min/target SDK and ARM64 JNI
+  library before publishing the APK as a downloadable Actions artifact.
+- For backward compatibility, the workflow also applies the exact onLowMemory
+  visibility correction to the CI checkout if an older source copy is used.
+
+Checks performed in this working environment:
+- All Android XML files parse.
+- CMakeLists.txt and JNI declaration/library naming were cross-checked.
+- Native C++ passes host g++ syntax-only validation with the local JNI headers.
+- GitHub Actions YAML parses and shell scripts are syntax checked.
+- ZIP archive is integrity checked.
+
+Not completed here:
+- A full Android Gradle/NDK build. This environment has no Android SDK/NDK and
+  outbound DNS/network is unavailable, so the actual cloud Runner must complete
+  the first Android-target build.
+- Installation and runtime testing on a physical phone.
+
+When the workflow completes successfully, download the artifact named
+"HopTrace-Android-APK" from that workflow run. It contains app-debug.apk and
+its SHA-256 checksum. This is a debug-signed installable APK, not a Play Store
+release build.
