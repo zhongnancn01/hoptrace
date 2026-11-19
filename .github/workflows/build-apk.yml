@@ -1,0 +1,239 @@
+name: Build HopTrace APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hoptrace-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and verify Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK command-line tools
+        uses: android-actions/setup-android@v4
+
+      - name: Install pinned Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1"
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "$SDK_ROOT" ]]; then
+            echo "::error::Android SDK root was not provided by setup-android."
+            exit 1
+          fi
+
+          # API 37 is packaged by sdkmanager as android-37.0, while AGP 9.5
+          # resolves compileSdk 37 using the android-37 directory name.
+          if [[ -d "$SDK_ROOT/platforms/android-37.0" && ! -e "$SDK_ROOT/platforms/android-37" ]]; then
+            ln -s android-37.0 "$SDK_ROOT/platforms/android-37"
+          fi
+
+          test -s "$SDK_ROOT/platforms/android-37/android.jar"
+          test -x "$SDK_ROOT/build-tools/37.0.0/aapt"
+          test -x "$SDK_ROOT/build-tools/37.0.0/apksigner"
+          test -x "$SDK_ROOT/ndk/28.2.13676358/ndk-build"
+          test -x "$SDK_ROOT/cmake/3.22.1/bin/cmake"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "Android SDK, Build Tools, NDK and CMake are installed and verified."
+
+      - name: Install Gradle 9.6.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="9.6.0"
+          ZIP="$RUNNER_TEMP/gradle-${VERSION}-bin.zip"
+          curl --fail --location --retry 4 --retry-delay 3 \
+            "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
+            --output "$ZIP"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gradle-${VERSION}/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/gradle-${VERSION}/bin/gradle" --version
+
+      - name: Locate project and preflight source
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOTS=()
+          while IFS= read -r -d '' f; do
+            candidate="$(dirname "$f")"
+            if [[ -f "$candidate/app/build.gradle" || -f "$candidate/app/build.gradle.kts" ]]; then
+              ROOTS+=("$candidate")
+            fi
+          done < <(find . -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -not -path '*/.git/*' -not -path '*/.gradle/*' -not -path '*/build/*' \
+            -print0 | sort -z)
+
+          if [[ ${#ROOTS[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one Android Gradle project; found ${#ROOTS[@]}."
+            printf 'Candidate: %s\n' "${ROOTS[@]}"
+            find . -maxdepth 5 -type f \
+              -not -path './.git/*' -not -path '*/.gradle/*' | sort | head -250
+            exit 1
+          fi
+
+          PROJECT_DIR="${ROOTS[0]#./}"
+          [[ -n "$PROJECT_DIR" ]] || PROJECT_DIR='.'
+          APP="$PROJECT_DIR/app"
+          MAIN="$APP/src/main/java/com/hoptrace/app/MainActivity.java"
+
+          required=(
+            "$PROJECT_DIR/settings.gradle"
+            "$PROJECT_DIR/build.gradle"
+            "$APP/build.gradle"
+            "$APP/src/main/AndroidManifest.xml"
+            "$APP/src/main/cpp/CMakeLists.txt"
+            "$APP/src/main/cpp/traceroute.cpp"
+            "$APP/src/main/java/com/hoptrace/app/NativeTraceroute.java"
+            "$MAIN"
+          )
+          for f in "${required[@]}"; do
+            if [[ ! -s "$f" ]]; then
+              echo "::error::Required project file is missing or empty: $f"
+              exit 1
+            fi
+          done
+
+          grep -Fq "applicationId 'com.hoptrace.app'" "$APP/build.gradle" || {
+            echo "::error::Unexpected applicationId; expected com.hoptrace.app."
+            exit 1
+          }
+          grep -Fq "compileSdk 37" "$APP/build.gradle" || {
+            echo "::error::compileSdk must be 37 for this build configuration."
+            exit 1
+          }
+          grep -Fq "targetSdk 37" "$APP/build.gradle" || {
+            echo "::error::targetSdk must be 37 for this build configuration."
+            exit 1
+          }
+          grep -Fq 'System.loadLibrary("hoptrace")' "$APP/src/main/java/com/hoptrace/app/NativeTraceroute.java" || {
+            echo "::error::JNI library name mismatch."
+            exit 1
+          }
+          grep -Fq 'add_library(hoptrace SHARED traceroute.cpp)' "$APP/src/main/cpp/CMakeLists.txt" || {
+            echo "::error::CMake target must produce libhoptrace.so."
+            exit 1
+          }
+
+          # The source archive originally shipped protected here. Activity
+          # implements ComponentCallbacks, whose onLowMemory() is public.
+          # Fix this exact known compiler blocker in the runner checkout too,
+          # so an older uploaded source folder still produces the corrected APK.
+          python3 - "$MAIN" <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          s = p.read_text(encoding='utf-8')
+          old = '@Override protected void onLowMemory()'
+          new = '@Override public void onLowMemory()'
+          if old in s:
+              if s.count(old) != 1:
+                  raise SystemExit(f'Expected one old onLowMemory declaration, found {s.count(old)}')
+              s = s.replace(old, new)
+              p.write_text(s, encoding='utf-8')
+              print('Applied onLowMemory() public visibility fix.')
+          elif s.count(new) == 1:
+              print('onLowMemory() visibility is already correct.')
+          else:
+              raise SystemExit('Could not verify the required public onLowMemory() override.')
+          PY
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "APK_PATH=$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_ENV"
+          echo "Detected and validated project root: $PROJECT_DIR"
+          echo "Source preflight passed."
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Building HopTrace from: $PROJECT_DIR"
+          gradle --no-daemon --stacktrace --console=plain \
+            --project-dir "$PROJECT_DIR" assembleDebug
+
+      - name: Verify APK package, signature and native libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$APK_PATH"
+          SDK="$ANDROID_SDK_ROOT"
+          AAPT="$SDK/build-tools/37.0.0/aapt"
+          APKSIGNER="$SDK/build-tools/37.0.0/apksigner"
+
+          if [[ ! -s "$APK" ]]; then
+            echo "::error::Gradle completed but the expected APK is missing: $APK"
+            find "$PROJECT_DIR/app/build/outputs" -maxdepth 6 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
+          "$APKSIGNER" verify --verbose "$APK"
+          "$AAPT" dump badging "$APK" > "$RUNNER_TEMP/hoptrace-badging.txt"
+          grep -Fq "package: name='com.hoptrace.app'" "$RUNNER_TEMP/hoptrace-badging.txt"
+          grep -Fq "sdkVersion:'26'" "$RUNNER_TEMP/hoptrace-badging.txt"
+          grep -Fq "targetSdkVersion:'37'" "$RUNNER_TEMP/hoptrace-badging.txt"
+
+          unzip -Z1 "$APK" > "$RUNNER_TEMP/hoptrace-apk-files.txt"
+          grep -Fxq 'lib/arm64-v8a/libhoptrace.so' "$RUNNER_TEMP/hoptrace-apk-files.txt" || {
+            echo "::error::ARM64 native traceroute library is missing from the APK."
+            exit 1
+          }
+
+          (
+            cd "$(dirname "$APK")"
+            sha256sum "$(basename "$APK")" > "$(basename "$APK").sha256"
+          )
+          echo "Verified APK metadata:"
+          grep -E "^(package:|sdkVersion:|targetSdkVersion:)" "$RUNNER_TEMP/hoptrace-badging.txt" || true
+          ls -lh "$APK" "$APK.sha256"
+          echo "APK verification passed."
+
+      - name: Upload installable APK and checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: HopTrace-Android-APK
+          path: |
+            ${{ env.APK_PATH }}
+            ${{ env.APK_PATH }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload build diagnostics if a step failed
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: HopTrace-build-diagnostics
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/reports
+            ${{ env.PROJECT_DIR }}/app/.cxx
+          if-no-files-found: ignore
+          retention-days: 7
